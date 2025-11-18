@@ -1,9 +1,10 @@
 import argparse
 import json
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Set
 
 import ollama
+from rich.console import Console
 
 from tools.code_search import (
     build_code_search_tool,
@@ -15,6 +16,9 @@ from tools.git_tools import build_git_tools
 from tools.namelist_tools import build_namelist_tool
 from tools.project_state import build_project_overview_tools
 from tools.tool_spec import ToolSpec
+
+FORTRAN_SUFFIXES: Set[str] = {".f", ".for", ".f90", ".f95", ".f03", ".f08"}
+console = Console()
 
 
 def load_context(context_path: Path) -> str:
@@ -82,8 +86,8 @@ def build_tools(args: argparse.Namespace) -> List[ToolSpec]:
     project_root = args.project_root.expanduser().resolve()
     repo_root = args.repo_root.expanduser().resolve()
 
-    print(f"Binding tools to project root: {project_root}")
-    print(f"Binding git tools to repo root: {repo_root}")
+    console.print(f"Binding tools to project root: {project_root}", style="cyan")
+    console.print(f"Binding git tools to repo root: {repo_root}", style="cyan")
 
     tools.append(build_file_reader_tool(project_root))
     tools.append(build_code_search_tool(project_root))
@@ -107,6 +111,40 @@ def _parse_arguments(raw_args) -> Dict:
     else:
         data = {}
     return data if isinstance(data, dict) else {}
+
+
+def _format_tool_call(name: str, args: Dict) -> str:
+    """Return a concise log entry for a tool invocation."""
+    tool_name = name or "unknown"
+    try:
+        arg_text = json.dumps(args or {}, ensure_ascii=True)
+    except TypeError:
+        arg_text = str(args)
+    return f"[tool] {tool_name}({arg_text})"
+
+
+def describe_fortran_files(project_root: Path) -> str:
+    """Return a readable list of Fortran source files under project_root."""
+    try:
+        root = project_root.expanduser().resolve()
+    except OSError:
+        return ""
+    if not root.exists():
+        return ""
+
+    files = []
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        if path.suffix.lower() in FORTRAN_SUFFIXES:
+            files.append(str(path.relative_to(root)))
+
+    if not files:
+        return "No Fortran source files were found in the project directory."
+
+    files.sort()
+    listing = "\n".join(f"- {relative}" for relative in files)
+    return f"Fortran source files detected in project root:\n{listing}"
 
 
 def call_model_with_tools(
@@ -133,6 +171,7 @@ def call_model_with_tools(
                 tool_output = f"Tool '{name}' is not available."
             else:
                 args = _parse_arguments(function_payload.get("arguments"))
+                console.print(_format_tool_call(name, args), style="bold red")
                 try:
                     tool_output = tool.func(args)
                 except Exception as exc:
@@ -150,18 +189,23 @@ def call_model_with_tools(
 def main():
     args = parse_args()
     tools = build_tools(args)
-    context = load_context(args.context_file)
+    base_context = load_context(args.context_file).strip()
+    fortran_listing = describe_fortran_files(args.project_root).strip()
+    context_sections = [
+        section for section in (base_context, fortran_listing) if section
+    ]
+    combined_context = "\n\n".join(context_sections)
 
     messages: List[Dict[str, str]] = [
-        {"role": "system", "content": build_system_prompt(context)}
+        {"role": "system", "content": build_system_prompt(combined_context)}
     ]
 
-    print("Ollama Fortran Agent ready. Type 'exit' to quit.\n")
+    console.print("Ollama Fortran Agent ready. Type 'exit' to quit.\n", style="cyan")
     while True:
         try:
-            query = input("User> ").strip()
+            query = console.input("[bold blue]User> [/bold blue]").strip()
         except (EOFError, KeyboardInterrupt):
-            print("\nExiting.")
+            console.print("\nExiting.", style="cyan")
             break
         if not query:
             continue
@@ -171,7 +215,7 @@ def main():
         reply = call_model_with_tools(args.model, messages, tools)
         messages.append(reply)
         output_text = reply.get("content", "").strip() or "(no response from model)"
-        print(f"\nAgent> {output_text}\n")
+        console.print(f"\nAgent> {output_text}\n", style="bold green")
 
 
 if __name__ == "__main__":

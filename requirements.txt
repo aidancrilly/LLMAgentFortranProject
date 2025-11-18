@@ -1,2 +1,3 @@
 ollama
 f90nml
+rich
