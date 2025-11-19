@@ -6,6 +6,7 @@ from typing import Dict, List, Set
 import ollama
 from rich.console import Console
 
+from tools.build_tools import build_build_tools
 from tools.code_search import (
     build_code_search_tool,
     build_fortran_summary_tool,
@@ -94,6 +95,7 @@ def build_tools(args: argparse.Namespace) -> List[ToolSpec]:
     tools.append(build_fortran_summary_tool(project_root))
     tools.append(build_fortran_symbol_extractor_tool(project_root))
     tools.extend(build_project_overview_tools(project_root))
+    tools.extend(build_build_tools(project_root))
     if args.namelist_path:
         tools.append(build_namelist_tool(args.namelist_path.expanduser().resolve()))
     tools.extend(build_git_tools(repo_root, args.base_branch))
