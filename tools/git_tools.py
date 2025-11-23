@@ -1,9 +1,13 @@
+import re
 import shlex
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Dict, List, Tuple
 
 from .tool_spec import ToolSpec
+
+LINE_DIRECTIVE_HEADER = re.compile(r"^\s*(\d+)\s*([+-])")
 
 
 def _run_git(repo_root: Path, args: List[str]) -> str:
@@ -67,8 +71,8 @@ def _format_git_command(args: List[str]) -> str:
     return f"git {formatter(args)}"
 
 
-def _resolve_patch_path(repo_root: Path, patch_path: str) -> Tuple[Path, str]:
-    candidate = Path(patch_path.strip() or "agent.patch").expanduser()
+def _resolve_repo_file(repo_root: Path, file_path: str) -> Tuple[Path, str]:
+    candidate = Path(file_path.strip()).expanduser()
     base = repo_root.resolve()
     if not candidate.is_absolute():
         candidate = (base / candidate).resolve()
@@ -77,70 +81,150 @@ def _resolve_patch_path(repo_root: Path, patch_path: str) -> Tuple[Path, str]:
     try:
         relative = candidate.relative_to(base)
     except ValueError:
-        raise ValueError("Patch path must stay within the repository root.")
+        raise ValueError("File path must stay within the repository root.")
     return candidate, str(relative)
 
 
-def _write_patch_file(repo_root: Path, patch_content: str, patch_path: str) -> str:
-    if not patch_content.strip():
-        return "Provide non-empty unified diff content via the 'patch' field."
+def _ensure_backup_file(
+    repo_root: Path, target: Path, relative_target: str
+) -> Tuple[bool, str]:
+    backup_path = target.with_name(target.name + ".orig")
+    base = repo_root.resolve()
     try:
-        patch_file, relative_path = _resolve_patch_path(repo_root, patch_path)
-    except ValueError as exc:
-        return str(exc)
+        backup_relative = str(backup_path.resolve().relative_to(base))
+    except ValueError:
+        backup_relative = str(backup_path)
+
+    if backup_path.exists():
+        return True, f"Backup already exists at '{backup_relative}'."
 
     try:
-        patch_file.parent.mkdir(parents=True, exist_ok=True)
-        patch_file.write_text(patch_content.rstrip() + "\n", encoding="utf-8")
+        backup_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(target, backup_path)
     except OSError as exc:
-        return f"Failed to write patch file: {exc}"
+        return False, f"Failed to create backup file: {exc}"
 
-    return f"Wrote patch file to {relative_path}"
+    return True, f"Copied '{relative_target}' to '{backup_relative}'."
 
 
-def _apply_patch_to_branch(
-    repo_root: Path, base_branch: str, branch_name: str, commit_message: str, patch_path: str
-) -> str:
-    branch = branch_name.strip()
-    if not branch:
-        return "Provide 'branch_name' for the branch that will receive the patch."
-    commit_msg = commit_message.strip()
-    if not commit_msg:
-        return "Provide 'commit_message' describing the applied changes."
+def _commit_files(repo_root: Path, commit_message: str, files: List[str]) -> str:
+    message = commit_message.strip()
+    if not message:
+        return "Provide 'commit_message' describing the changes."
 
-    try:
-        patch_file, relative_patch = _resolve_patch_path(repo_root, patch_path)
-    except ValueError as exc:
-        return str(exc)
-
-    if not patch_file.exists():
-        return f"Patch file '{relative_patch}' does not exist. Run GitCreatePatch first."
-
-    commands = [
-        ["checkout", base_branch],
-        ["checkout", "-b", branch],
-        ["apply", str(patch_file)],
-        ["add", "-A"],
-        ["commit", "-m", commit_msg],
-    ]
+    if files:
+        add_args = ["add"] + files
+    else:
+        add_args = ["add", "-A"]
 
     run_log = []
-    for cmd in commands:
-        success, output = _run_git_checked(repo_root, cmd)
-        run_log.append(f"$ {_format_git_command(cmd)}\n{output}")
-        if not success:
-            return (
-                "GitApplyPatch aborted due to an error:\n"
-                + "\n\n".join(run_log)
-            )
+    success, output = _run_git_checked(repo_root, add_args)
+    run_log.append(f"$ {_format_git_command(add_args)}\n{output}")
+    if not success:
+        return "GitCommitFiles aborted while staging changes:\n\n" + "\n\n".join(run_log)
+
+    commit_args = ["commit", "-m", message]
+    success, output = _run_git_checked(repo_root, commit_args)
+    run_log.append(f"$ {_format_git_command(commit_args)}\n{output}")
+    if not success:
+        return "GitCommitFiles aborted while committing changes:\n\n" + "\n\n".join(run_log)
+
+    return "Changes committed successfully.\n\n" + "\n\n".join(run_log)
+
+
+def _parse_edit_directives(edit_script: str) -> Tuple[bool, str, List[Tuple[int, str, str]]]:
+    directives: List[Tuple[int, str, str]] = []
+    for raw_line in edit_script.splitlines():
+        line = raw_line.rstrip("\n")
+        if not line.strip():
+            continue
+        header = LINE_DIRECTIVE_HEADER.match(line)
+        if not header:
+            return False, f"Could not parse edit directive '{raw_line}'. Expected 'LINE +/- content'."
+        line_no = int(header.group(1))
+        op = header.group(2)
+        remainder = line[header.end():]
+        if remainder.startswith((" ", "\t")):
+            if len(remainder) == 1:
+                remainder = ""
+            elif remainder[1] not in (" ", "\t"):
+                remainder = remainder[1:]
+        directives.append((line_no, op, remainder))
+    if not directives:
+        return False, "Provide at least one non-empty edit directive."
+    return True, "", directives
+
+
+def _edit_file_with_directives(repo_root: Path, file_path: str, edit_script: str) -> str:
+    if not file_path.strip():
+        return "Provide 'file_path' for the file you want to edit."
+    if not edit_script.strip():
+        return "Provide 'edits' containing line-number directives."
+    try:
+        target, relative = _resolve_repo_file(repo_root, file_path)
+    except ValueError as exc:
+        return str(exc)
+    if not target.exists():
+        return f"File '{relative}' does not exist."
+    if not target.is_file():
+        return f"Path '{relative}' is not a regular file."
+
+    success, backup_msg = _ensure_backup_file(repo_root, target, relative)
+    if not success:
+        return backup_msg
+
+    ok, error_msg, directives = _parse_edit_directives(edit_script)
+    if not ok:
+        return error_msg
+
+    try:
+        original_text = target.read_text(encoding="utf-8")
+    except OSError as exc:
+        return f"Failed to read '{relative}': {exc}"
+
+    lines = original_text.splitlines()
+    had_trailing_newline = original_text.endswith("\n")
+
+    directives.sort(key=lambda item: (-item[0], 0 if item[1] == "-" else 1))
+
+    additions = 0
+    removals = 0
+    for line_no, op, content in directives:
+        if line_no <= 0:
+            return f"Line numbers must be positive. Invalid entry: {line_no}."
+        index = line_no - 1
+        if op == "-":
+            if index >= len(lines):
+                return f"Cannot remove line {line_no}: file has only {len(lines)} lines."
+            existing = lines[index]
+            if content and existing != content:
+                return (
+                    f"Line {line_no} mismatch for removal.\nExpected: {content}\nFound: {existing}"
+                )
+            del lines[index]
+            removals += 1
+        else:
+            if index > len(lines):
+                return f"Cannot insert at line {line_no}: file has only {len(lines)} lines."
+            lines.insert(index, content)
+            additions += 1
+
+    new_text = "\n".join(lines)
+    if had_trailing_newline:
+        new_text += "\n"
+
+    try:
+        target.write_text(new_text, encoding="utf-8")
+    except OSError as exc:
+        return f"Failed to write '{relative}': {exc}"
 
     return (
-        f"Patch from '{relative_patch}' applied on new branch '{branch}'.\n\n"
-        + "\n\n".join(run_log)
+        f"{backup_msg}\nApplied {additions} addition(s) and {removals} removal(s) to '{relative}'."
     )
 
 
 def build_git_tools(repo_root: Path, base_branch: str) -> List[ToolSpec]:
+    _ = base_branch  # retained for compatibility; not needed without patch workflow.
     status_tool = ToolSpec(
         name="GitStatus",
         description="Show the current git status and branch information.",
@@ -167,67 +251,76 @@ def build_git_tools(repo_root: Path, base_branch: str) -> List[ToolSpec]:
         func=_diff_tool,
     )
 
-    def _create_patch_tool(args: Dict[str, str]) -> str:
-        patch_content = args.get("patch") or ""
-        patch_path = args.get("patch_path") or "agent.patch"
-        return _write_patch_file(repo_root, patch_content, patch_path)
+    def _edit_tool(args: Dict[str, str]) -> str:
+        file_path = args.get("file_path") or ""
+        edits = args.get("edits") or ""
+        return _edit_file_with_directives(repo_root, file_path, edits)
 
-    create_patch_tool = ToolSpec(
-        name="GitCreatePatch",
+    edit_tool = ToolSpec(
+        name="GitEditFile",
         description=(
-            "Persist agent-provided unified diff content to a patch file under the repository root. "
-            "Call this once you have concrete edits to apply."
+            "Apply targeted edits to a file using 'line +/- content' directives. "
+            "Automatically writes '<file>.orig' before modifying the original."
         ),
         parameters={
             "type": "object",
             "properties": {
-                "patch": {
+                "file_path": {
                     "type": "string",
-                    "description": "Unified diff output describing the desired edits.",
+                    "description": "Relative path to the repository file to modify.",
                 },
-                "patch_path": {
+                "edits": {
                     "type": "string",
-                    "description": "Relative path for the patch file (default 'agent.patch').",
+                    "description": (
+                        "Edit directives, one per line, formatted as 'LINE +/- text'. "
+                        "Use '-' to remove the specified line and '+' to insert before that line number. "
+                        "Append by targeting the total line count + 1."
+                    ),
                 },
             },
-            "required": ["patch"],
+            "required": ["file_path", "edits"],
         },
-        func=_create_patch_tool,
+        func=_edit_tool,
     )
 
-    def _apply_patch_tool(args: Dict[str, str]) -> str:
-        patch_path = args.get("patch_path") or "agent.patch"
-        branch_name = args.get("branch_name") or ""
+    def _commit_tool(args: Dict[str, str]) -> str:
         commit_message = args.get("commit_message") or ""
-        return _apply_patch_to_branch(
-            repo_root, base_branch, branch_name, commit_message, patch_path
-        )
+        files_arg = args.get("files")
+        files: List[str] = []
+        if files_arg is None:
+            files = []
+        elif isinstance(files_arg, list):
+            files = [str(item) for item in files_arg if str(item).strip()]
+        else:
+            return "'files' must be an array of relative file paths."
+        return _commit_files(repo_root, commit_message, files)
 
-    apply_patch_tool = ToolSpec(
-        name="GitApplyPatch",
+    commit_tool = ToolSpec(
+        name="GitCommitFiles",
         description=(
-            "Checkout the base branch, create a new branch, apply the stored patch, stage all changes, "
-            "and commit with the provided message. No pull is performed."
+            "Stage specified files (or everything if omitted) and create a commit with the provided message."
         ),
         parameters={
             "type": "object",
             "properties": {
-                "patch_path": {
-                    "type": "string",
-                    "description": "Relative path to the patch file produced by GitCreatePatch (default 'agent.patch').",
-                },
-                "branch_name": {
-                    "type": "string",
-                    "description": "Name for the new branch that will be created from the base branch.",
-                },
                 "commit_message": {
                     "type": "string",
-                    "description": "Commit message to use after applying the patch.",
+                    "description": "Commit message describing the changes.",
+                },
+                "files": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional list of file paths to pass to 'git add'. If omitted, 'git add -A' is used.",
                 },
             },
-            "required": ["branch_name", "commit_message"],
+            "required": ["commit_message"],
         },
-        func=_apply_patch_tool,
+        func=_commit_tool,
     )
 
-    return [status_tool, diff_tool, create_patch_tool, apply_patch_tool]
+    return [
+        status_tool,
+        diff_tool,
+        edit_tool,
+        commit_tool,
+    ]

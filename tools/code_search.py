@@ -183,7 +183,11 @@ def extract_fortran_symbol(
         )
         return f"Could not find {target} in {path}."
     end_index = entity.end_index if entity.end_index is not None else entity.start_index
-    snippet = "\n".join(lines[entity.start_index : end_index + 1])
+    snippet_lines = []
+    for offset, raw_line in enumerate(lines[entity.start_index : end_index + 1]):
+        line_no = entity.start_index + offset + 1
+        snippet_lines.append(f"{line_no:>6}: {raw_line}")
+    snippet = "\n".join(snippet_lines)
     kind_label = entity.kind.title()
     return (
         f"# {kind_label} {entity.name} from {path}"
@@ -271,28 +275,25 @@ def build_fortran_summary_tool(project_root: Path) -> ToolSpec:
     )
 
 
-def build_fortran_symbol_extractor_tool(project_root: Path) -> ToolSpec:
+def _build_specific_symbol_tool(project_root: Path, symbol_kind: str) -> ToolSpec:
+    kind_title = symbol_kind.title()
+
     def _tool(args: Dict[str, str]) -> str:
         file_path = args.get("file_path", "").strip()
         symbol_name = args.get("symbol_name", "").strip()
-        symbol_kind = args.get("symbol_kind")
         if not file_path:
             return "Provide 'file_path' for the Fortran source file."
         if not symbol_name:
-            return "Provide 'symbol_name' for the subroutine/function to extract."
-        normalized_kind = symbol_kind.strip().lower() if symbol_kind else None
-        if normalized_kind and normalized_kind not in FORTRAN_KEYWORDS:
-            allowed = ", ".join(FORTRAN_KEYWORDS)
-            return f"'symbol_kind' must be one of: {allowed}."
+            return f"Provide 'symbol_name' for the {symbol_kind} to extract."
         return extract_fortran_symbol(
-            project_root, file_path, symbol_name, normalized_kind
+            project_root, file_path, symbol_name, symbol_kind
         )
 
     return ToolSpec(
-        name="ReadFortranSymbol",
+        name=f"ReadFortran{kind_title}",
         description=(
-            "Return the exact source code for a specific Fortran program/module/"
-            "subroutine/function identified by name."
+            f"Return the exact source code for a specific Fortran {symbol_kind} "
+            "identified by name."
         ),
         parameters={
             "type": "object",
@@ -303,15 +304,16 @@ def build_fortran_symbol_extractor_tool(project_root: Path) -> ToolSpec:
                 },
                 "symbol_name": {
                     "type": "string",
-                    "description": "Name of the program/module/subroutine/function.",
-                },
-                "symbol_kind": {
-                    "type": "string",
-                    "enum": [k for k in FORTRAN_KEYWORDS],
-                    "description": "Optional kind filter to disambiguate the symbol.",
+                    "description": f"Name of the target Fortran {symbol_kind}.",
                 },
             },
             "required": ["file_path", "symbol_name"],
         },
         func=_tool,
     )
+
+
+def build_fortran_symbol_reader_tools(project_root: Path) -> List[ToolSpec]:
+    return [
+        _build_specific_symbol_tool(project_root, kind) for kind in FORTRAN_KEYWORDS
+    ]

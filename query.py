@@ -10,7 +10,7 @@ from tools.build_tools import build_build_tools
 from tools.code_search import (
     build_code_search_tool,
     build_fortran_summary_tool,
-    build_fortran_symbol_extractor_tool,
+    build_fortran_symbol_reader_tools,
 )
 from tools.file_tools import build_file_reader_tool
 from tools.git_tools import build_git_tools
@@ -93,7 +93,7 @@ def build_tools(args: argparse.Namespace) -> List[ToolSpec]:
     tools.append(build_file_reader_tool(project_root))
     tools.append(build_code_search_tool(project_root))
     tools.append(build_fortran_summary_tool(project_root))
-    tools.append(build_fortran_symbol_extractor_tool(project_root))
+    tools.extend(build_fortran_symbol_reader_tools(project_root))
     tools.extend(build_project_overview_tools(project_root))
     tools.extend(build_build_tools(project_root))
     if args.namelist_path:
