@@ -3,8 +3,9 @@ import shlex
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
+from .path_utils import resolve_within_root
 from .tool_spec import ToolSpec
 
 LINE_DIRECTIVE_HEADER = re.compile(r"^\s*(\d+)\s*([+-])")
@@ -72,16 +73,11 @@ def _format_git_command(args: List[str]) -> str:
 
 
 def _resolve_repo_file(repo_root: Path, file_path: str) -> Tuple[Path, str]:
-    candidate = Path(file_path.strip()).expanduser()
-    base = repo_root.resolve()
-    if not candidate.is_absolute():
-        candidate = (base / candidate).resolve()
-    else:
-        candidate = candidate.resolve()
     try:
-        relative = candidate.relative_to(base)
-    except ValueError:
-        raise ValueError("File path must stay within the repository root.")
+        candidate = resolve_within_root(repo_root, file_path)
+    except ValueError as exc:
+        raise ValueError(str(exc)) from exc
+    relative = candidate.relative_to(repo_root.resolve())
     return candidate, str(relative)
 
 
@@ -155,60 +151,90 @@ def _parse_edit_directives(edit_script: str) -> Tuple[bool, str, List[Tuple[int,
     return True, "", directives
 
 
-def _edit_file_with_directives(repo_root: Path, file_path: str, edit_script: str) -> str:
+def _prepare_edit_state(
+    repo_root: Path, file_path: str, edit_script: str
+) -> Tuple[Optional[Path], Optional[str], Optional[str], List[Tuple[int, str, str]], str]:
     if not file_path.strip():
-        return "Provide 'file_path' for the file you want to edit."
+        return None, None, None, [], "Provide 'file_path' for the file you want to edit."
     if not edit_script.strip():
-        return "Provide 'edits' containing line-number directives."
+        return None, None, None, [], "Provide 'edits' containing line-number directives."
     try:
         target, relative = _resolve_repo_file(repo_root, file_path)
     except ValueError as exc:
-        return str(exc)
+        return None, None, None, [], str(exc)
     if not target.exists():
-        return f"File '{relative}' does not exist."
+        return None, None, None, [], f"File '{relative}' does not exist."
     if not target.is_file():
-        return f"Path '{relative}' is not a regular file."
+        return None, None, None, [], f"Path '{relative}' is not a regular file."
 
     success, backup_msg = _ensure_backup_file(repo_root, target, relative)
     if not success:
-        return backup_msg
+        return None, None, None, [], backup_msg
 
     ok, error_msg, directives = _parse_edit_directives(edit_script)
     if not ok:
-        return error_msg
+        return None, None, None, [], error_msg
 
+    return target, relative, backup_msg, directives, ""
+
+
+def _read_file_lines(target: Path, relative: str) -> Tuple[List[str], bool, str]:
     try:
         original_text = target.read_text(encoding="utf-8")
     except OSError as exc:
-        return f"Failed to read '{relative}': {exc}"
+        return [], False, f"Failed to read '{relative}': {exc}"
 
     lines = original_text.splitlines()
     had_trailing_newline = original_text.endswith("\n")
+    return lines, had_trailing_newline, ""
 
-    directives.sort(key=lambda item: (-item[0], 0 if item[1] == "-" else 1))
 
+def _apply_line_directives(
+    lines: List[str], directives: List[Tuple[int, str, str]]
+) -> Tuple[bool, str, int, int]:
     additions = 0
     removals = 0
+    directives.sort(key=lambda item: (-item[0], 0 if item[1] == "-" else 1))
+
     for line_no, op, content in directives:
         if line_no <= 0:
-            return f"Line numbers must be positive. Invalid entry: {line_no}."
+            return False, f"Line numbers must be positive. Invalid entry: {line_no}.", 0, 0
         index = line_no - 1
         if op == "-":
             if index >= len(lines):
-                return f"Cannot remove line {line_no}: file has only {len(lines)} lines."
+                return (
+                    False,
+                    f"Cannot remove line {line_no}: file has only {len(lines)} lines.",
+                    0,
+                    0,
+                )
             existing = lines[index]
             if content and existing != content:
                 return (
-                    f"Line {line_no} mismatch for removal.\nExpected: {content}\nFound: {existing}"
+                    False,
+                    f"Line {line_no} mismatch for removal.\nExpected: {content}\nFound: {existing}",
+                    0,
+                    0,
                 )
             del lines[index]
             removals += 1
         else:
             if index > len(lines):
-                return f"Cannot insert at line {line_no}: file has only {len(lines)} lines."
+                return (
+                    False,
+                    f"Cannot insert at line {line_no}: file has only {len(lines)} lines.",
+                    0,
+                    0,
+                )
             lines.insert(index, content)
             additions += 1
 
+    return True, "", additions, removals
+
+
+def _write_updated_file(
+    target: Path, relative: str, lines: List[str], had_trailing_newline: bool
+) -> str:
     new_text = "\n".join(lines)
     if had_trailing_newline:
         new_text += "\n"
@@ -217,10 +243,33 @@ def _edit_file_with_directives(repo_root: Path, file_path: str, edit_script: str
         target.write_text(new_text, encoding="utf-8")
     except OSError as exc:
         return f"Failed to write '{relative}': {exc}"
+    return ""
+
+
+def _edit_file_with_directives(repo_root: Path, file_path: str, edit_script: str) -> str:
+    target, relative, backup_msg, directives, error = _prepare_edit_state(
+        repo_root, file_path, edit_script
+    )
+    if error:
+        return error
+    assert target is not None and relative is not None and backup_msg is not None
+
+    lines, had_trailing_newline, error = _read_file_lines(target, relative)
+    if error:
+        return error
+
+    ok, error, additions, removals = _apply_line_directives(lines, directives)
+    if not ok:
+        return error
+
+    error = _write_updated_file(target, relative, lines, had_trailing_newline)
+    if error:
+        return error
 
     return (
         f"{backup_msg}\nApplied {additions} addition(s) and {removals} removal(s) to '{relative}'."
     )
+
 
 
 def build_git_tools(repo_root: Path, base_branch: str) -> List[ToolSpec]:

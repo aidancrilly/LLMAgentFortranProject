@@ -1,17 +1,8 @@
 from pathlib import Path
-from typing import Dict, Iterable, List
+from typing import Dict, List
 
+from .fortran_utils import iter_fortran_sources
 from .tool_spec import ToolSpec
-
-
-def _iter_fortran_files(project_root: Path, max_files: int) -> Iterable[Path]:
-    count = 0
-    for file_path in sorted(project_root.rglob("*")):
-        if file_path.suffix.lower() in (".f90", ".f95", ".f") and file_path.is_file():
-            yield file_path
-            count += 1
-            if count >= max_files:
-                break
 
 
 def describe_project(project_root: Path, max_entries: int = 200) -> str:
@@ -26,7 +17,11 @@ def describe_project(project_root: Path, max_entries: int = 200) -> str:
 
 
 def list_fortran_sources(project_root: Path, max_files: int = 30) -> str:
-    files = [str(path.relative_to(project_root)) for path in _iter_fortran_files(project_root, max_files)]
+    sorted_paths = sorted(
+        (path for path in iter_fortran_sources(project_root)),
+        key=lambda path: str(path.relative_to(project_root)),
+    )
+    files = [str(path.relative_to(project_root)) for path in sorted_paths[:max_files]]
     if not files:
         return f"No Fortran sources found under {project_root}"
     return "Fortran sources:\n" + "\n".join(files)

@@ -1,39 +1,10 @@
-import re
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+from .fortran_utils import FORTRAN_SOURCE_SUFFIXES, FORTRAN_KEYWORDS, DECLARATION_PATTERN, END_PATTERN, FortranEntity, iter_fortran_sources
+from .path_utils import resolve_within_root
+from .snippet_utils import format_numbered_snippet
 from .tool_spec import ToolSpec
-
-FORTRAN_EXTENSIONS = (".f", ".f90", ".f95", ".f03", ".for")
-FORTRAN_KEYWORDS = ("program", "module", "subroutine", "function")
-DECLARATION_PATTERN = re.compile(
-    r"(program|module|subroutine|function)\s+([A-Za-z_]\w*)", re.IGNORECASE
-)
-END_PATTERN = re.compile(
-    r"^end\s*(program|module|subroutine|function)?(?:\s+([A-Za-z_]\w*))?",
-    re.IGNORECASE,
-)
-
-
-@dataclass
-class FortranEntity:
-    kind: str
-    name: str
-    start_line: int
-    start_index: int
-    end_line: Optional[int] = None
-    end_index: Optional[int] = None
-    children: List["FortranEntity"] = field(default_factory=list)
-
-
-def _collect_files(
-    project_root: Path, include_extensions: Sequence[str]
-) -> Iterable[Path]:
-    for path in project_root.rglob("*"):
-        if path.is_file() and path.suffix.lower() in include_extensions:
-            yield path
-
 
 def _remove_inline_comment(line: str) -> str:
     """Strip trailing ! comments while respecting quoted strings."""
@@ -106,24 +77,10 @@ def _format_entity_tree(entity: FortranEntity, indent: int = 0) -> List[str]:
 
 
 def _resolve_project_path(project_root: Path, file_path: str) -> Path:
-    # Remove leading slashes and normalize the path
-    path = Path(file_path.strip().lstrip('/').lstrip('\\'))
-    
-    # Always combine with project root if not an absolute path
-    if not path.is_absolute():
-        path = project_root / path
-    
-    # Resolve to get absolute, normalized path
-    path = path.resolve()
-
     try:
-        path.relative_to(project_root.resolve())
+        return resolve_within_root(project_root, file_path)
     except ValueError as exc:  # pragma: no cover - defensive path check
-        raise ValueError(
-            f"Requested path {path} is outside the project root {project_root}"
-        ) from exc
-
-    return path
+        raise ValueError(str(exc)) from exc
 
 
 def summarise_fortran_file(project_root: Path, file_path: str) -> str:
@@ -183,11 +140,10 @@ def extract_fortran_symbol(
         )
         return f"Could not find {target} in {path}."
     end_index = entity.end_index if entity.end_index is not None else entity.start_index
-    snippet_lines = []
-    for offset, raw_line in enumerate(lines[entity.start_index : end_index + 1]):
-        line_no = entity.start_index + offset + 1
-        snippet_lines.append(f"{line_no:>6}: {raw_line}")
-    snippet = "\n".join(snippet_lines)
+    snippet_lines = lines[entity.start_index : end_index + 1]
+    snippet = format_numbered_snippet(
+        snippet_lines, start_line=entity.start_index + 1, width=6
+    )
     kind_label = entity.kind.title()
     return (
         f"# {kind_label} {entity.name} from {path}"
@@ -199,14 +155,25 @@ def extract_fortran_symbol(
 def search_codebase(
     project_root: Path,
     query: str,
-    include_extensions: Sequence[str] = FORTRAN_EXTENSIONS,
+    include_extensions: Sequence[str] = FORTRAN_SOURCE_SUFFIXES,
     max_matches: int = 5,
     preview_chars: int = 1000,
 ) -> str:
     """Return snippets of files that match the query string."""
     matches: List[str] = []
     lowered = query.lower()
-    for file_path in _collect_files(project_root, include_extensions):
+    suffixes = tuple(ext.lower() for ext in include_extensions)
+    candidates: Iterable[Path]
+    if suffixes == tuple(FORTRAN_SOURCE_SUFFIXES):
+        candidates = iter_fortran_sources(project_root)
+    else:
+        candidates = (
+            path
+            for path in project_root.rglob("*")
+            if path.is_file() and path.suffix.lower() in suffixes
+        )
+
+    for file_path in candidates:
         try:
             content = file_path.read_text(encoding="utf-8", errors="ignore")
             if lowered in content.lower():

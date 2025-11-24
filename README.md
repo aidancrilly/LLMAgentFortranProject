@@ -1,6 +1,6 @@
 # LLMAgentFortranProject
 
-Note: WORK IN PROGRESS
+Note: WORK IN PROGRESS, lots of vibe-coding with testing
 
 An Ollama-powered tool-calling agent designed to inspect Fortran projects, answer code questions, and draft git command sequences that implement requested changes. The assistant talks directly to Ollama's Python client and advertises a small suite of local tools (file reader, code search, git helpers, etc.) that the model can invoke as needed.
 
@@ -11,7 +11,6 @@ An Ollama-powered tool-calling agent designed to inspect Fortran projects, answe
 - Access to the Fortran codebase you want the agent to explore
 
 See the [Ollama PoC guide](https://github.com/RamiKrispin/ollama-poc?tab=readme-ov-file) for a quick start on configuring Ollama.
-
 
 ## Running the Agent
 
