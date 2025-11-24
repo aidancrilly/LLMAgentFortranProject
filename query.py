@@ -65,7 +65,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--context-file",
         type=Path,
-        default=Path("AGEND.md"),
+        default=Path("AGENT.md"),
         help="Priming document injected before the conversation.",
     )
     return parser.parse_args()
