@@ -1,7 +1,7 @@
 import argparse
 import json
 from pathlib import Path
-from typing import Dict, List, Set
+from typing import Dict, List
 
 import ollama
 from rich.console import Console
@@ -13,12 +13,12 @@ from tools.code_search import (
     build_fortran_symbol_reader_tools,
 )
 from tools.file_tools import build_file_reader_tool
+from tools.fortran_utils import iter_fortran_sources
 from tools.git_tools import build_git_tools
 from tools.namelist_tools import build_namelist_tool
 from tools.project_state import build_project_overview_tools
 from tools.tool_spec import ToolSpec
 
-FORTRAN_SUFFIXES: Set[str] = {".f", ".for", ".f90", ".f95", ".f03", ".f08"}
 console = Console()
 
 
@@ -53,7 +53,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model",
         type=str,
-        default="qwen3:1.7b",
+        default="gpt-oss-20b",
         help="Ollama model identifier to load.",
     )
     parser.add_argument(
@@ -134,12 +134,7 @@ def describe_fortran_files(project_root: Path) -> str:
     if not root.exists():
         return ""
 
-    files = []
-    for path in root.rglob("*"):
-        if not path.is_file():
-            continue
-        if path.suffix.lower() in FORTRAN_SUFFIXES:
-            files.append(str(path.relative_to(root)))
+    files = [str(path.relative_to(root)) for path in iter_fortran_sources(root)]
 
     if not files:
         return "No Fortran source files were found in the project directory."
@@ -147,6 +142,33 @@ def describe_fortran_files(project_root: Path) -> str:
     files.sort()
     listing = "\n".join(f"- {relative}" for relative in files)
     return f"Fortran source files detected in project root:\n{listing}"
+
+
+def _invoke_tool(tool: ToolSpec, args: Dict, call_name: str) -> str:
+    console.print(_format_tool_call(call_name, args), style="bold red")
+    try:
+        return tool.func(args)
+    except Exception as exc:
+        return f"Tool '{call_name}' raised an error: {exc}"
+
+
+def _handle_tool_call(
+    call: Dict, name_to_tool: Dict[str, ToolSpec]
+) -> Dict[str, str]:
+    payload = call.get("function", {}) or {}
+    name = payload.get("name") or "unknown"
+    args = _parse_arguments(payload.get("arguments"))
+    tool = name_to_tool.get(name)
+    if not tool:
+        content = f"Tool '{name}' is not available."
+    else:
+        content = _invoke_tool(tool, args, name)
+    return {
+        "role": "tool",
+        "name": name,
+        "content": content,
+        "tool_call_id": call.get("id"),
+    }
 
 
 def call_model_with_tools(
@@ -158,34 +180,16 @@ def call_model_with_tools(
 
     while True:
         response = ollama.chat(model=model, messages=messages, tools=ollama_tools)
-
-        message = response.get("message", {})
+        message = response.get("message", {}) or {}
         tool_calls = message.get("tool_calls") or []
         if not tool_calls:
             return message
 
         messages.append(message)
-        for call in tool_calls:
-            function_payload = call.get("function", {})
-            name = function_payload.get("name")
-            tool = name_to_tool.get(name)
-            if not tool:
-                tool_output = f"Tool '{name}' is not available."
-            else:
-                args = _parse_arguments(function_payload.get("arguments"))
-                console.print(_format_tool_call(name, args), style="bold red")
-                try:
-                    tool_output = tool.func(args)
-                except Exception as exc:
-                    tool_output = f"Tool '{name}' raised an error: {exc}"
-            messages.append(
-                {
-                    "role": "tool",
-                    "name": name or "unknown",
-                    "content": tool_output,
-                    "tool_call_id": call.get("id"),
-                }
-            )
+        tool_messages = [
+            _handle_tool_call(call, name_to_tool) for call in tool_calls
+        ]
+        messages.extend(tool_messages)
 
 
 def main():
