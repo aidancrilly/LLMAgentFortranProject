@@ -257,31 +257,112 @@ def _write_updated_file(
     return ""
 
 
-def _edit_file_with_directives(
-    repo_root: Path, file_path: str, edits: List[Dict[str, Any]]
+def _replace_block_in_file(
+    project_root: Path,
+    file_path: str,
+    start_line: int,
+    end_line: int,
+    replacement: str,
 ) -> str:
-    target, relative, backup_msg, directives, error = _prepare_edit_state(
-        repo_root, file_path, edits
-    )
-    if error:
-        return error
-    assert target is not None and relative is not None and backup_msg is not None
+    """
+    Replace or insert a contiguous block of lines in a file.
 
+    Semantics:
+      - Lines are 1-based.
+      - If start_line <= end_line: replace the inclusive line range [start_line, end_line]
+        with the replacement text.
+      - If end_line == start_line - 1: insert the replacement text BEFORE start_line
+        without deleting any lines.
+      - To append at the end of the file, use start_line = current_line_count + 1
+        and end_line = current_line_count (i.e., pure insertion at the end).
+    """
+    if not file_path.strip():
+        return "Provide 'file_path' for the file you want to edit."
+
+    # Basic line validation before we even touch the file
+    if start_line <= 0:
+        return "'start_line' must be a positive integer."
+    if end_line < start_line - 1:
+        return (
+            "'end_line' must be >= start_line - 1.\n"
+            "Use end_line = start_line - 1 to insert without deleting any existing lines."
+        )
+
+    # Resolve file and ensure it exists
+    try:
+        target, relative = _resolve_repo_file(project_root, file_path)
+    except ValueError as exc:
+        return str(exc)
+
+    if not target.exists():
+        return f"File '{relative}' does not exist."
+    if not target.is_file():
+        return f"Path '{relative}' is not a regular file."
+
+    # Ensure backup
+    success, backup_msg = _ensure_backup_file(project_root, target, relative)
+    if not success:
+        return backup_msg
+
+    # Read file lines
     lines, had_trailing_newline, error = _read_file_lines(target, relative)
     if error:
         return error
 
-    ok, error, additions, removals = _apply_line_directives(lines, directives)
-    if not ok:
-        return error
+    n_lines = len(lines)
 
+    # Now that we know the actual file length, validate the range more precisely
+    if start_line > n_lines + 1:
+        return (
+            f"'start_line' ({start_line}) is out of range. "
+            f"File '{relative}' has only {n_lines} line(s)."
+        )
+    if end_line > n_lines:
+        return (
+            f"'end_line' ({end_line}) is out of range. "
+            f"File '{relative}' has only {n_lines} line(s)."
+        )
+
+    # Convert to 0-based indices
+    start_idx = start_line - 1
+
+    # When end_line >= start_line, we replace that inclusive range.
+    # For 0-based slicing, end_exclusive = end_line.
+    if end_line >= start_line:
+        end_exclusive = end_line
+    else:
+        # Pure insertion: delete an empty slice
+        end_exclusive = start_idx
+
+    # Prepare replacement lines (can be multi-line)
+    if replacement:
+        replacement_lines = replacement.splitlines()
+    else:
+        replacement_lines = []
+
+    # Apply the replacement
+    lines[start_idx:end_exclusive] = replacement_lines
+
+    # Write back to disk
     error = _write_updated_file(target, relative, lines, had_trailing_newline)
     if error:
         return error
 
-    return (
-        f"{backup_msg}\nApplied {additions} addition(s) and {removals} removal(s) to '{relative}'."
-    )
+    if end_line >= start_line:
+        replaced_count = (end_exclusive - start_idx)
+        return (
+            f"{backup_msg}\n"
+            f"Replaced {replaced_count} line(s) in '{relative}' "
+            f"from line {start_line} to {end_line} with a block of "
+            f"{len(replacement_lines)} line(s)."
+        )
+    else:
+        # Pure insertion
+        return (
+            f"{backup_msg}\n"
+            f"Inserted a block of {len(replacement_lines)} line(s) into '{relative}' "
+            f"starting at line {start_line}."
+        )
 
 
 
@@ -313,19 +394,45 @@ def build_git_tools(project_root: Path, repo_root: Path, base_branch: str) -> Li
         func=_diff_tool,
     )
 
-    def _edit_tool(args: Dict[str, Any]) -> str:
+    def _replace_block_tool(args: Dict[str, Any]) -> str:
         file_path_value = args.get("file_path") or ""
         file_path = str(file_path_value)
-        edits_value = args.get("edits")
-        if not isinstance(edits_value, list):
-            return "'edits' must be a list of directive objects."
-        return _edit_file_with_directives(project_root, file_path, edits_value)
 
-    edit_tool = ToolSpec(
-        name="GitEditFile",
+        try:
+            start_line = int(args.get("start_line"))
+        except (TypeError, ValueError):
+            return "'start_line' must be an integer."
+
+        try:
+            end_line = int(args.get("end_line"))
+        except (TypeError, ValueError):
+            return "'end_line' must be an integer."
+
+        replacement_value = args.get("replacement") or ""
+        replacement = str(replacement_value)
+
+        return _replace_block_in_file(
+            project_root,
+            file_path,
+            start_line,
+            end_line,
+            replacement,
+        )
+
+    replace_block_tool = ToolSpec(
+        name="GitReplaceBlock",
         description=(
-            "Apply targeted edits to a file using structured directives. "
-            "Automatically writes '<file>.orig' before modifying the original."
+            "Replace or insert a contiguous block of lines in a text file.\n\n"
+            "Usage:\n"
+            "1. Choose 'start_line' and 'end_line' for the block you want to modify.\n"
+            "   - If start_line <= end_line: the lines from start_line to end_line "
+            "     (inclusive, 1-based) will be replaced by 'replacement'.\n"
+            "   - If end_line == start_line - 1: 'replacement' will be inserted "
+            "     before start_line without deleting existing lines.\n"
+            "   - To append at the end, use start_line = current_line_count + 1 and "
+            "     end_line = current_line_count (pure insertion at the end).\n"
+            "2. 'replacement' can be multi-line text.\n\n"
+            "The tool automatically writes '<file>.orig' as a backup before modifying the file."
         ),
         parameters={
             "type": "object",
@@ -334,38 +441,30 @@ def build_git_tools(project_root: Path, repo_root: Path, base_branch: str) -> Li
                     "type": "string",
                     "description": "Relative path to the repository file to modify.",
                 },
-                "edits": {
-                    "type": "array",
+                "start_line": {
+                    "type": "integer",
                     "description": (
-                        "List of directive objects that specify a line number, an operation ('+' or '-'), "
-                        "and optional text when inserting or validating removals. Use '-' to remove the "
-                        "specified line and '+' to insert the provided text before that line number. "
-                        "Append by targeting the total line count + 1."
+                        "1-based line number where the replacement/insertion starts."
                     ),
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "line": {
-                                "type": "integer",
-                                "description": "1-indexed line number where the directive applies.",
-                            },
-                            "op": {
-                                "type": "string",
-                                "enum": ["+", "-"],
-                                "description": "Operation to perform: '+' insert, '-' remove.",
-                            },
-                            "text": {
-                                "type": "string",
-                                "description": "Text to insert or to match when removing a line.",
-                            },
-                        },
-                        "required": ["line", "op"],
-                    },
+                },
+                "end_line": {
+                    "type": "integer",
+                    "description": (
+                        "1-based line number where the replacement ends (inclusive). "
+                        "Use end_line = start_line - 1 for pure insertion."
+                    ),
+                },
+                "replacement": {
+                    "type": "string",
+                    "description": (
+                        "New text to place in the specified region. "
+                        "May span multiple lines."
+                    ),
                 },
             },
-            "required": ["file_path", "edits"],
+            "required": ["file_path", "start_line", "end_line", "replacement"],
         },
-        func=_edit_tool,
+        func=_replace_block_tool,
     )
 
     def _commit_tool(args: Dict[str, str]) -> str:
@@ -406,6 +505,6 @@ def build_git_tools(project_root: Path, repo_root: Path, base_branch: str) -> Li
     return [
         status_tool,
         diff_tool,
-        edit_tool,
+        replace_block_tool,
         commit_tool,
     ]

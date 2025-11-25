@@ -68,6 +68,17 @@ def parse_args() -> argparse.Namespace:
         default=Path("AGENT.md"),
         help="Priming document injected before the conversation.",
     )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable verbose logging.",
+    )
+    parser.add_argument(
+        "--context-length",
+        type=int,
+        default=4000,
+        help="Maximum context length (in tokens) for the agent.",
+    )
     return parser.parse_args()
 
 
@@ -174,14 +185,14 @@ def _handle_tool_call(
 
 
 def call_model_with_tools(
-    model: str, messages: List[Dict[str, str]], tools: List[ToolSpec]
+    model: str, messages: List[Dict[str, str]], tools: List[ToolSpec], num_ctx: int
 ) -> Dict[str, str]:
     """Send the conversation to Ollama, honoring tool-calling responses."""
     name_to_tool = {tool.name: tool for tool in tools}
     ollama_tools = [tool.as_ollama_tool() for tool in tools]
 
     while True:
-        response = ollama.chat(model=model, messages=messages, tools=ollama_tools)
+        response = ollama.chat(model=model, messages=messages, tools=ollama_tools, options={"num_ctx" : num_ctx})
         message = response.get("message", {}) or {}
         tool_calls = message.get("tool_calls") or []
         if not tool_calls:
@@ -220,7 +231,7 @@ def main():
         if query.lower() in {"exit", "quit"}:
             break
         messages.append({"role": "user", "content": query})
-        reply = call_model_with_tools(args.model, messages, tools)
+        reply = call_model_with_tools(args.model, messages, tools, args.context_length)
         messages.append(reply)
         output_text = reply.get("content", "").strip() or "(no response from model)"
         console.print(f"\nAgent> {output_text}\n", style="bold green")
