@@ -98,7 +98,7 @@ def build_tools(args: argparse.Namespace) -> List[ToolSpec]:
     tools.extend(build_build_tools(project_root))
     if args.namelist_path:
         tools.append(build_namelist_tool(args.namelist_path.expanduser().resolve()))
-    tools.extend(build_git_tools(repo_root, args.base_branch))
+    tools.extend(build_git_tools(project_root, repo_root, args.base_branch))
     return tools
 
 
@@ -141,6 +141,7 @@ def describe_fortran_files(project_root: Path) -> str:
 
     files.sort()
     listing = "\n".join(f"- {relative}" for relative in files)
+    console.print(f"Fortran source files detected in project root:\n{listing}")
     return f"Fortran source files detected in project root:\n{listing}"
 
 
@@ -163,6 +164,7 @@ def _handle_tool_call(
         content = f"Tool '{name}' is not available."
     else:
         content = _invoke_tool(tool, args, name)
+    console.print(f'{content}\n', style="yellow")
     return {
         "role": "tool",
         "name": name,

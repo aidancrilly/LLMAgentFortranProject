@@ -272,7 +272,7 @@ def _edit_file_with_directives(repo_root: Path, file_path: str, edit_script: str
 
 
 
-def build_git_tools(repo_root: Path, base_branch: str) -> List[ToolSpec]:
+def build_git_tools(project_root: Path, repo_root: Path, base_branch: str) -> List[ToolSpec]:
     _ = base_branch  # retained for compatibility; not needed without patch workflow.
     status_tool = ToolSpec(
         name="GitStatus",
@@ -303,7 +303,7 @@ def build_git_tools(repo_root: Path, base_branch: str) -> List[ToolSpec]:
     def _edit_tool(args: Dict[str, str]) -> str:
         file_path = args.get("file_path") or ""
         edits = args.get("edits") or ""
-        return _edit_file_with_directives(repo_root, file_path, edits)
+        return _edit_file_with_directives(project_root, file_path, edits)
 
     edit_tool = ToolSpec(
         name="GitEditFile",

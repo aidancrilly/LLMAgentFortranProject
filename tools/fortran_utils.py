@@ -27,7 +27,7 @@ DECLARATION_PATTERN = re.compile(
     r"(program|module|subroutine|function)\s+([A-Za-z_]\w*)", re.IGNORECASE
 )
 END_PATTERN = re.compile(
-    r"^end\s*(program|module|subroutine|function)?(?:\s+([A-Za-z_]\w*))?",
+    r"^end\s*(program|module|subroutine|function)(?:\s+([A-Za-z_]\w*))?",
     re.IGNORECASE,
 )
 
