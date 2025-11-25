@@ -257,113 +257,51 @@ def _write_updated_file(
     return ""
 
 
-def _replace_block_in_file(
+def _write_whole_file(
     project_root: Path,
     file_path: str,
-    start_line: int,
-    end_line: int,
-    replacement: str,
+    content: str,
 ) -> str:
     """
-    Replace or insert a contiguous block of lines in a file.
+    Overwrite a file with the exact content provided. If the file already exists,
+    a backup '<file>.orig' is created first. If the file does not exist, it is
+    created along with any missing parent directories.
 
-    Semantics:
-      - Lines are 1-based.
-      - If start_line <= end_line: replace the inclusive line range [start_line, end_line]
-        with the replacement text.
-      - If end_line == start_line - 1: insert the replacement text BEFORE start_line
-        without deleting any lines.
-      - To append at the end of the file, use start_line = current_line_count + 1
-        and end_line = current_line_count (i.e., pure insertion at the end).
+    The content is written as-is using UTF-8 encoding.
     """
     if not file_path.strip():
-        return "Provide 'file_path' for the file you want to edit."
+        return "Provide 'file_path' for the file you want to write."
 
-    # Basic line validation before we even touch the file
-    if start_line <= 0:
-        return "'start_line' must be a positive integer."
-    if end_line < start_line - 1:
-        return (
-            "'end_line' must be >= start_line - 1.\n"
-            "Use end_line = start_line - 1 to insert without deleting any existing lines."
-        )
-
-    # Resolve file and ensure it exists
+    # Resolve file path within the project root to avoid escaping the repo.
     try:
         target, relative = _resolve_repo_file(project_root, file_path)
     except ValueError as exc:
         return str(exc)
 
-    if not target.exists():
-        return f"File '{relative}' does not exist."
-    if not target.is_file():
-        return f"Path '{relative}' is not a regular file."
+    # If the file already exists, create a backup alongside it.
+    backup_msg = ""
+    if target.exists():
+        if not target.is_file():
+            return f"Path '{relative}' is not a regular file."
+        success, backup_msg = _ensure_backup_file(project_root, target, relative)
+        if not success:
+            return backup_msg
 
-    # Ensure backup
-    success, backup_msg = _ensure_backup_file(project_root, target, relative)
-    if not success:
-        return backup_msg
+    # Make sure the directory exists
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return f"Failed to create parent directory for '{relative}': {exc}"
 
-    # Read file lines
-    lines, had_trailing_newline, error = _read_file_lines(target, relative)
-    if error:
-        return error
+    # Write new content as-is
+    try:
+        target.write_text(content, encoding="utf-8")
+    except OSError as exc:
+        return f"Failed to write '{relative}': {exc}"
 
-    n_lines = len(lines)
-
-    # Now that we know the actual file length, validate the range more precisely
-    if start_line > n_lines + 1:
-        return (
-            f"'start_line' ({start_line}) is out of range. "
-            f"File '{relative}' has only {n_lines} line(s)."
-        )
-    if end_line > n_lines:
-        return (
-            f"'end_line' ({end_line}) is out of range. "
-            f"File '{relative}' has only {n_lines} line(s)."
-        )
-
-    # Convert to 0-based indices
-    start_idx = start_line - 1
-
-    # When end_line >= start_line, we replace that inclusive range.
-    # For 0-based slicing, end_exclusive = end_line.
-    if end_line >= start_line:
-        end_exclusive = end_line
-    else:
-        # Pure insertion: delete an empty slice
-        end_exclusive = start_idx
-
-    # Prepare replacement lines (can be multi-line)
-    if replacement:
-        replacement_lines = replacement.splitlines()
-    else:
-        replacement_lines = []
-
-    # Apply the replacement
-    lines[start_idx:end_exclusive] = replacement_lines
-
-    # Write back to disk
-    error = _write_updated_file(target, relative, lines, had_trailing_newline)
-    if error:
-        return error
-
-    if end_line >= start_line:
-        replaced_count = (end_exclusive - start_idx)
-        return (
-            f"{backup_msg}\n"
-            f"Replaced {replaced_count} line(s) in '{relative}' "
-            f"from line {start_line} to {end_line} with a block of "
-            f"{len(replacement_lines)} line(s)."
-        )
-    else:
-        # Pure insertion
-        return (
-            f"{backup_msg}\n"
-            f"Inserted a block of {len(replacement_lines)} line(s) into '{relative}' "
-            f"starting at line {start_line}."
-        )
-
+    if backup_msg:
+        return f"{backup_msg}\nWrote {len(content)} byte(s) to '{relative}'."
+    return f"Wrote {len(content)} byte(s) to new file '{relative}'."
 
 
 def build_git_tools(project_root: Path, repo_root: Path, base_branch: str) -> List[ToolSpec]:
@@ -394,77 +332,46 @@ def build_git_tools(project_root: Path, repo_root: Path, base_branch: str) -> Li
         func=_diff_tool,
     )
 
-    def _replace_block_tool(args: Dict[str, Any]) -> str:
+    def _write_file_tool(args: Dict[str, Any]) -> str:
         file_path_value = args.get("file_path") or ""
         file_path = str(file_path_value)
 
-        try:
-            start_line = int(args.get("start_line"))
-        except (TypeError, ValueError):
-            return "'start_line' must be an integer."
+        content_value = args.get("content")
+        if content_value is None:
+            # Be explicit: content must be provided
+            return "Provide 'content' with the complete new contents of the file."
 
-        try:
-            end_line = int(args.get("end_line"))
-        except (TypeError, ValueError):
-            return "'end_line' must be an integer."
+        content = str(content_value)
+        return _write_whole_file(project_root, file_path, content)
 
-        replacement_value = args.get("replacement") or ""
-        replacement = str(replacement_value)
-
-        return _replace_block_in_file(
-            project_root,
-            file_path,
-            start_line,
-            end_line,
-            replacement,
-        )
-
-    replace_block_tool = ToolSpec(
-        name="GitReplaceBlock",
+    write_file_tool = ToolSpec(
+        name="GitWriteFile",
         description=(
-            "Replace or insert a contiguous block of lines in a text file.\n\n"
+            "Overwrite a file with the exact content you provide.\n\n"
             "Usage:\n"
-            "1. Choose 'start_line' and 'end_line' for the block you want to modify.\n"
-            "   - If start_line <= end_line: the lines from start_line to end_line "
-            "     (inclusive, 1-based) will be replaced by 'replacement'.\n"
-            "   - If end_line == start_line - 1: 'replacement' will be inserted "
-            "     before start_line without deleting existing lines.\n"
-            "   - To append at the end, use start_line = current_line_count + 1 and "
-            "     end_line = current_line_count (pure insertion at the end).\n"
-            "2. 'replacement' can be multi-line text.\n\n"
-            "The tool automatically writes '<file>.orig' as a backup before modifying the file."
+            "1. First, read the whole file (if it exists) to understand its current contents.\n"
+            "2. Prepare the FULL new contents of the file as a single string. Do not use expressions like 'text' + 'more'; they are invalid JSON.\n"
+            "3. Call this tool with 'file_path' and 'content'.\n\n"
+            "If the file already exists, a '<file>.orig' backup is created first. "
+            "If it does not exist, it is created along with any missing parent directories."
         ),
         parameters={
             "type": "object",
             "properties": {
                 "file_path": {
                     "type": "string",
-                    "description": "Relative path to the repository file to modify.",
+                    "description": "Relative path to the repository file to overwrite or create.",
                 },
-                "start_line": {
-                    "type": "integer",
-                    "description": (
-                        "1-based line number where the replacement/insertion starts."
-                    ),
-                },
-                "end_line": {
-                    "type": "integer",
-                    "description": (
-                        "1-based line number where the replacement ends (inclusive). "
-                        "Use end_line = start_line - 1 for pure insertion."
-                    ),
-                },
-                "replacement": {
+                "content": {
                     "type": "string",
                     "description": (
-                        "New text to place in the specified region. "
-                        "May span multiple lines."
+                        "Complete new contents of the file. This replaces any existing content."
                     ),
                 },
             },
-            "required": ["file_path", "start_line", "end_line", "replacement"],
+            "required": ["file_path", "content"],
         },
-        func=_replace_block_tool,
+        func=_write_file_tool,
     )
 
     def _commit_tool(args: Dict[str, str]) -> str:
@@ -505,6 +412,6 @@ def build_git_tools(project_root: Path, repo_root: Path, base_branch: str) -> Li
     return [
         status_tool,
         diff_tool,
-        replace_block_tool,
+        write_file_tool,
         commit_tool,
     ]

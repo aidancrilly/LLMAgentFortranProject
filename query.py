@@ -12,7 +12,7 @@ from tools.code_search import (
     build_fortran_summary_tool,
     build_fortran_symbol_reader_tools,
 )
-from tools.file_tools import build_file_reader_tool
+from tools.file_tools import build_file_reader_tools
 from tools.fortran_utils import iter_fortran_sources
 from tools.git_tools import build_git_tools
 from tools.namelist_tools import build_namelist_tool
@@ -101,9 +101,9 @@ def build_tools(args: argparse.Namespace) -> List[ToolSpec]:
     console.print(f"Binding tools to project root: {project_root}", style="cyan")
     console.print(f"Binding git tools to repo root: {repo_root}", style="cyan")
 
-    tools.append(build_file_reader_tool(project_root))
     tools.append(build_code_search_tool(project_root))
     tools.append(build_fortran_summary_tool(project_root))
+    tools.extend(build_file_reader_tools(project_root))
     tools.extend(build_fortran_symbol_reader_tools(project_root))
     tools.extend(build_project_overview_tools(project_root))
     tools.extend(build_build_tools(project_root))

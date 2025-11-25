@@ -30,10 +30,10 @@ def read_file(
     return header if not numbered else f"{header}\n{numbered}"
 
 
-def build_file_reader_tool(project_root: Path) -> ToolSpec:
+def build_file_reader_tools(project_root: Path) -> ToolSpec:
     """Factory that binds the project root to the ReadFile tool."""
 
-    def _tool(args: Dict[str, int]) -> str:
+    def _snippet_tool(args: Dict[str, int]) -> str:
         path = args.get("path", ".")
         start = int(args.get("start_line", 1) or 1)
         max_lines_value = args.get("max_lines")
@@ -42,8 +42,8 @@ def build_file_reader_tool(project_root: Path) -> ToolSpec:
         )
         return read_file(project_root, path, start_line=start, max_lines=max_lines_int)
 
-    return ToolSpec(
-        name="ReadFile",
+    read_file_snippet_tool = ToolSpec(
+        name="ReadFileSnippet",
         description=(
             "Read a specific slice of a project file. Provide 'path' plus optional "
             "'start_line' and 'max_lines' integers."
@@ -68,5 +68,29 @@ def build_file_reader_tool(project_root: Path) -> ToolSpec:
             },
             "required": ["path"],
         },
-        func=_tool,
+        func=_snippet_tool,
     )
+
+    def _whole_file_tool(args: Dict) -> str:
+        path = args.get("path", ".")
+        return read_file(project_root, path, start_line=1, max_lines=10000)
+
+    read_whole_file_tool = ToolSpec(
+        name="ReadWholeFile",
+        description=(
+            "Read entirety of a project file. Provide 'path' only."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Relative or absolute path to the file.",
+                },
+            },
+            "required": ["path"],
+        },
+        func=_whole_file_tool,
+    )
+
+    return [read_file_snippet_tool,read_whole_file_tool]
