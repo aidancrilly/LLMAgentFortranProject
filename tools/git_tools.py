@@ -1,14 +1,11 @@
-import re
 import shlex
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from .path_utils import resolve_within_root
 from .tool_spec import ToolSpec
-
-LINE_DIRECTIVE_HEADER = re.compile(r"^\s*(\d+)\s*([+-])")
 
 
 def _run_git(repo_root: Path, args: List[str]) -> str:
@@ -128,36 +125,50 @@ def _commit_files(repo_root: Path, commit_message: str, files: List[str]) -> str
     return "Changes committed successfully.\n\n" + "\n\n".join(run_log)
 
 
-def _parse_edit_directives(edit_script: str) -> Tuple[bool, str, List[Tuple[int, str, str]]]:
+def _parse_edit_directives(
+    edits: List[Dict[str, Any]]
+) -> Tuple[bool, str, List[Tuple[int, str, str]]]:
     directives: List[Tuple[int, str, str]] = []
-    for raw_line in edit_script.splitlines():
-        line = raw_line.rstrip("\n")
-        if not line.strip():
-            continue
-        header = LINE_DIRECTIVE_HEADER.match(line)
-        if not header:
-            return False, f"Could not parse edit directive '{raw_line}'. Expected 'LINE +/- content'."
-        line_no = int(header.group(1))
-        op = header.group(2)
-        remainder = line[header.end():]
-        if remainder.startswith((" ", "\t")):
-            if len(remainder) == 1:
-                remainder = ""
-            elif remainder[1] not in (" ", "\t"):
-                remainder = remainder[1:]
-        directives.append((line_no, op, remainder))
-    if not directives:
-        return False, "Provide at least one non-empty edit directive."
+    if not edits:
+        return False, "Provide at least one edit directive.", []
+
+    for idx, entry in enumerate(edits):
+        if not isinstance(entry, dict):
+            return False, f"Edit entry at index {idx} must be an object.", []
+
+        line_value = entry.get("line")
+        try:
+            line_no = int(line_value)
+        except (TypeError, ValueError):
+            return False, f"'line' for edit entry at index {idx} must be an integer.", []
+        if line_no <= 0:
+            return False, f"'line' for edit entry at index {idx} must be positive.", []
+
+        op_value = entry.get("op")
+        if not isinstance(op_value, str) or op_value not in {"+", "-"}:
+            return False, f"'op' for edit entry at index {idx} must be '+' or '-'.", []
+
+        text_value = entry.get("text", "")
+        if text_value is None:
+            text_str = ""
+        elif isinstance(text_value, str):
+            text_str = text_value
+        else:
+            text_str = str(text_value)
+        text_str = text_str.rstrip("\r\n")
+
+        directives.append((line_no, op_value, text_str))
+
     return True, "", directives
 
 
 def _prepare_edit_state(
-    repo_root: Path, file_path: str, edit_script: str
+    repo_root: Path, file_path: str, edits: List[Dict[str, Any]]
 ) -> Tuple[Optional[Path], Optional[str], Optional[str], List[Tuple[int, str, str]], str]:
     if not file_path.strip():
         return None, None, None, [], "Provide 'file_path' for the file you want to edit."
-    if not edit_script.strip():
-        return None, None, None, [], "Provide 'edits' containing line-number directives."
+    if not edits:
+        return None, None, None, [], "Provide 'edits' containing at least one directive."
     try:
         target, relative = _resolve_repo_file(repo_root, file_path)
     except ValueError as exc:
@@ -171,7 +182,7 @@ def _prepare_edit_state(
     if not success:
         return None, None, None, [], backup_msg
 
-    ok, error_msg, directives = _parse_edit_directives(edit_script)
+    ok, error_msg, directives = _parse_edit_directives(edits)
     if not ok:
         return None, None, None, [], error_msg
 
@@ -246,9 +257,11 @@ def _write_updated_file(
     return ""
 
 
-def _edit_file_with_directives(repo_root: Path, file_path: str, edit_script: str) -> str:
+def _edit_file_with_directives(
+    repo_root: Path, file_path: str, edits: List[Dict[str, Any]]
+) -> str:
     target, relative, backup_msg, directives, error = _prepare_edit_state(
-        repo_root, file_path, edit_script
+        repo_root, file_path, edits
     )
     if error:
         return error
@@ -300,15 +313,18 @@ def build_git_tools(project_root: Path, repo_root: Path, base_branch: str) -> Li
         func=_diff_tool,
     )
 
-    def _edit_tool(args: Dict[str, str]) -> str:
-        file_path = args.get("file_path") or ""
-        edits = args.get("edits") or ""
-        return _edit_file_with_directives(project_root, file_path, edits)
+    def _edit_tool(args: Dict[str, Any]) -> str:
+        file_path_value = args.get("file_path") or ""
+        file_path = str(file_path_value)
+        edits_value = args.get("edits")
+        if not isinstance(edits_value, list):
+            return "'edits' must be a list of directive objects."
+        return _edit_file_with_directives(project_root, file_path, edits_value)
 
     edit_tool = ToolSpec(
         name="GitEditFile",
         description=(
-            "Apply targeted edits to a file using 'line +/- content' directives. "
+            "Apply targeted edits to a file using structured directives. "
             "Automatically writes '<file>.orig' before modifying the original."
         ),
         parameters={
@@ -319,12 +335,32 @@ def build_git_tools(project_root: Path, repo_root: Path, base_branch: str) -> Li
                     "description": "Relative path to the repository file to modify.",
                 },
                 "edits": {
-                    "type": "string",
+                    "type": "array",
                     "description": (
-                        "Edit directives, one per line, formatted as 'LINE +/- text'. "
-                        "Use '-' to remove the specified line and '+' to insert before that line number. "
+                        "List of directive objects that specify a line number, an operation ('+' or '-'), "
+                        "and optional text when inserting or validating removals. Use '-' to remove the "
+                        "specified line and '+' to insert the provided text before that line number. "
                         "Append by targeting the total line count + 1."
                     ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "line": {
+                                "type": "integer",
+                                "description": "1-indexed line number where the directive applies.",
+                            },
+                            "op": {
+                                "type": "string",
+                                "enum": ["+", "-"],
+                                "description": "Operation to perform: '+' insert, '-' remove.",
+                            },
+                            "text": {
+                                "type": "string",
+                                "description": "Text to insert or to match when removing a line.",
+                            },
+                        },
+                        "required": ["line", "op"],
+                    },
                 },
             },
             "required": ["file_path", "edits"],

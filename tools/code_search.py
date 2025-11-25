@@ -156,16 +156,21 @@ def search_codebase(
     project_root: Path,
     query: str,
     include_extensions: Sequence[str] = FORTRAN_SOURCE_SUFFIXES,
-    max_matches: int = 5,
-    preview_chars: int = 1000,
+    max_matches: int = 10,
+    context_lines: int = 3,
 ) -> str:
-    """Return snippets of files that match the query string."""
+    """Return line-based snippets of all occurrences of `query` in the codebase.
+
+    For each matching line, returns up to `context_lines` lines before and after
+    the line containing the query (case-insensitive), up to `max_matches` total
+    snippets across all files.
+    """
     matches: List[str] = []
     lowered = query.lower()
     suffixes = tuple(ext.lower() for ext in include_extensions)
-    candidates: Iterable[Path]
+
     if suffixes == tuple(FORTRAN_SOURCE_SUFFIXES):
-        candidates = iter_fortran_sources(project_root)
+        candidates: Iterable[Path] = iter_fortran_sources(project_root)
     else:
         candidates = (
             path
@@ -175,14 +180,45 @@ def search_codebase(
 
     for file_path in candidates:
         try:
-            content = file_path.read_text(encoding="utf-8", errors="ignore")
-            if lowered in content.lower():
-                snippet = content[:preview_chars]
-                matches.append(f"File: {file_path}\n---\n{snippet}\n...")
+            lines = file_path.read_text(encoding="utf-8", errors="ignore").splitlines(keepends=True)
+
+            # Find all matching line indices in this file
+            match_indices: List[int] = [
+                i for i, line in enumerate(lines) if lowered in line.lower()
+            ]
+
+            if not match_indices:
+                continue
+
+            for occurrence_idx, match_index in enumerate(match_indices, start=1):
+                start = max(0, match_index - context_lines)
+                end = min(len(lines), match_index + context_lines + 1)
+
+                snippet_lines = lines[start:end]
+                snippet = "".join(snippet_lines)
+
+                # 1-based line numbers
+                match_line_no = match_index + 1
+                start_line_no = start + 1
+                end_line_no = end
+
+                matches.append(
+                    f"File: {file_path} (match {occurrence_idx} at line {match_line_no}, "
+                    f"context lines {start_line_no}-{end_line_no})\n"
+                    f"---\n"
+                    f"{snippet}\n"
+                    f"..."
+                )
+
+                if len(matches) >= max_matches:
+                    break
+
         except Exception as exc:
             matches.append(f"Error reading {file_path}: {exc}")
+
         if len(matches) >= max_matches:
             break
+
     if not matches:
         return f"No references to '{query}' found under {project_root}"
     return "\n\n".join(matches)
