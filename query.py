@@ -13,6 +13,7 @@ from tools.code_search import (
     build_fortran_symbol_reader_tools,
 )
 from tools.file_tools import build_file_reader_tools
+from tools.fortran_edit_tools import build_fortran_edit_tools
 from tools.fortran_utils import iter_fortran_sources
 from tools.git_tools import build_git_tools
 from tools.namelist_tools import build_namelist_tool
@@ -105,6 +106,7 @@ def build_tools(args: argparse.Namespace) -> List[ToolSpec]:
     tools.append(build_fortran_summary_tool(project_root))
     tools.extend(build_file_reader_tools(project_root))
     tools.extend(build_fortran_symbol_reader_tools(project_root))
+    tools.extend(build_fortran_edit_tools(project_root))
     tools.extend(build_project_overview_tools(project_root))
     tools.extend(build_build_tools(project_root))
     if args.namelist_path:

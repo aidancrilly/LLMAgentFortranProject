@@ -1,70 +1,17 @@
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence
 
-from .fortran_utils import FORTRAN_SOURCE_SUFFIXES, FORTRAN_KEYWORDS, DECLARATION_PATTERN, END_PATTERN, FortranEntity, iter_fortran_sources
+from .fortran_utils import (
+    FORTRAN_SOURCE_SUFFIXES,
+    FORTRAN_KEYWORDS,
+    FortranEntity,
+    find_entity_by_name,
+    iter_fortran_sources,
+    parse_fortran_entities,
+)
 from .path_utils import resolve_within_root
 from .snippet_utils import format_numbered_snippet
 from .tool_spec import ToolSpec
-
-def _remove_inline_comment(line: str) -> str:
-    """Strip trailing ! comments while respecting quoted strings."""
-    result: List[str] = []
-    in_single = False
-    in_double = False
-    for char in line:
-        if char == "'" and not in_double:
-            in_single = not in_single
-        elif char == '"' and not in_single:
-            in_double = not in_double
-        elif char == "!" and not in_single and not in_double:
-            break
-        result.append(char)
-    return "".join(result)
-
-
-def _analyze_fortran_file(content: str) -> Tuple[FortranEntity, List[str]]:
-    """Return the parsed entity tree plus the original lines."""
-    lines = content.splitlines()
-    root = FortranEntity(kind="__root__", name="root", start_line=0, start_index=0)
-    stack: List[FortranEntity] = [root]
-
-    for idx, raw_line in enumerate(lines):
-        stripped = _remove_inline_comment(raw_line).strip()
-        if not stripped:
-            continue
-        lowered = stripped.lower()
-        if lowered.startswith("contains"):
-            continue
-        if lowered.startswith("end"):
-            if END_PATTERN.match(stripped) and len(stack) > 1:
-                entity = stack.pop()
-                entity.end_line = idx + 1
-                entity.end_index = idx
-            continue
-
-        matches = list(DECLARATION_PATTERN.finditer(stripped))
-        if not matches:
-            continue
-        match = matches[-1]
-        kind = match.group(1).lower()
-        name = match.group(2)
-        if kind == "module":
-            trailing = stripped[match.end() :].strip()
-            if trailing:
-                # Skip lines such as "module procedure foo".
-                continue
-        entity = FortranEntity(
-            kind=kind, name=name, start_line=idx + 1, start_index=idx
-        )
-        stack[-1].children.append(entity)
-        stack.append(entity)
-
-    while len(stack) > 1:
-        entity = stack.pop()
-        entity.end_line = len(lines)
-        entity.end_index = max(len(lines) - 1, entity.start_index)
-
-    return root, lines
 
 
 def _format_entity_tree(entity: FortranEntity, indent: int = 0) -> List[str]:
@@ -96,27 +43,12 @@ def summarise_fortran_file(project_root: Path, file_path: str) -> str:
         content = path.read_text(encoding="utf-8", errors="ignore")
     except Exception as exc:  # pragma: no cover - filesystem errors
         return f"Failed to read {path}: {exc}"
-    root, _ = _analyze_fortran_file(content)
+    root, _ = parse_fortran_entities(content)
     structure_lines = _format_entity_tree(root)
     if not structure_lines:
         return f"No program/module/subroutine/function declarations found in {path}."
     header = f"# Structure of {path}"
     return header + "\n" + "\n".join(structure_lines)
-
-
-def _find_entity_by_name(
-    entity: FortranEntity, symbol_name: str, symbol_kind: Optional[str]
-) -> Optional[FortranEntity]:
-    normalized_name = symbol_name.lower()
-    normalized_kind = symbol_kind.lower() if symbol_kind else None
-    for child in entity.children:
-        if child.name.lower() == normalized_name:
-            if normalized_kind is None or child.kind == normalized_kind:
-                return child
-        result = _find_entity_by_name(child, symbol_name, symbol_kind)
-        if result:
-            return result
-    return None
 
 
 def extract_fortran_symbol(
@@ -132,8 +64,8 @@ def extract_fortran_symbol(
         content = path.read_text(encoding="utf-8", errors="ignore")
     except Exception as exc:  # pragma: no cover - filesystem errors
         return f"Failed to read {path}: {exc}"
-    root, lines = _analyze_fortran_file(content)
-    entity = _find_entity_by_name(root, symbol_name, symbol_kind)
+    root, lines = parse_fortran_entities(content)
+    entity = find_entity_by_name(root, symbol_name, symbol_kind)
     if not entity:
         target = (
             f"{symbol_kind} '{symbol_name}'" if symbol_kind else f"symbol '{symbol_name}'"

@@ -1,10 +1,8 @@
 import shlex
-import shutil
 import subprocess
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
-from .path_utils import resolve_within_root
 from .tool_spec import ToolSpec
 
 
@@ -69,37 +67,6 @@ def _format_git_command(args: List[str]) -> str:
     return f"git {formatter(args)}"
 
 
-def _resolve_repo_file(repo_root: Path, file_path: str) -> Tuple[Path, str]:
-    try:
-        candidate = resolve_within_root(repo_root, file_path)
-    except ValueError as exc:
-        raise ValueError(str(exc)) from exc
-    relative = candidate.relative_to(repo_root.resolve())
-    return candidate, str(relative)
-
-
-def _ensure_backup_file(
-    repo_root: Path, target: Path, relative_target: str
-) -> Tuple[bool, str]:
-    backup_path = target.with_name(target.name + ".orig")
-    base = repo_root.resolve()
-    try:
-        backup_relative = str(backup_path.resolve().relative_to(base))
-    except ValueError:
-        backup_relative = str(backup_path)
-
-    if backup_path.exists():
-        return True, f"Backup already exists at '{backup_relative}'."
-
-    try:
-        backup_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(target, backup_path)
-    except OSError as exc:
-        return False, f"Failed to create backup file: {exc}"
-
-    return True, f"Copied '{relative_target}' to '{backup_relative}'."
-
-
 def _commit_files(repo_root: Path, commit_message: str, files: List[str]) -> str:
     message = commit_message.strip()
     if not message:
@@ -125,186 +92,8 @@ def _commit_files(repo_root: Path, commit_message: str, files: List[str]) -> str
     return "Changes committed successfully.\n\n" + "\n\n".join(run_log)
 
 
-def _parse_edit_directives(
-    edits: List[Dict[str, Any]]
-) -> Tuple[bool, str, List[Tuple[int, str, str]]]:
-    directives: List[Tuple[int, str, str]] = []
-    if not edits:
-        return False, "Provide at least one edit directive.", []
-
-    for idx, entry in enumerate(edits):
-        if not isinstance(entry, dict):
-            return False, f"Edit entry at index {idx} must be an object.", []
-
-        line_value = entry.get("line")
-        try:
-            line_no = int(line_value)
-        except (TypeError, ValueError):
-            return False, f"'line' for edit entry at index {idx} must be an integer.", []
-        if line_no <= 0:
-            return False, f"'line' for edit entry at index {idx} must be positive.", []
-
-        op_value = entry.get("op")
-        if not isinstance(op_value, str) or op_value not in {"+", "-"}:
-            return False, f"'op' for edit entry at index {idx} must be '+' or '-'.", []
-
-        text_value = entry.get("text", "")
-        if text_value is None:
-            text_str = ""
-        elif isinstance(text_value, str):
-            text_str = text_value
-        else:
-            text_str = str(text_value)
-        text_str = text_str.rstrip("\r\n")
-
-        directives.append((line_no, op_value, text_str))
-
-    return True, "", directives
-
-
-def _prepare_edit_state(
-    repo_root: Path, file_path: str, edits: List[Dict[str, Any]]
-) -> Tuple[Optional[Path], Optional[str], Optional[str], List[Tuple[int, str, str]], str]:
-    if not file_path.strip():
-        return None, None, None, [], "Provide 'file_path' for the file you want to edit."
-    if not edits:
-        return None, None, None, [], "Provide 'edits' containing at least one directive."
-    try:
-        target, relative = _resolve_repo_file(repo_root, file_path)
-    except ValueError as exc:
-        return None, None, None, [], str(exc)
-    if not target.exists():
-        return None, None, None, [], f"File '{relative}' does not exist."
-    if not target.is_file():
-        return None, None, None, [], f"Path '{relative}' is not a regular file."
-
-    success, backup_msg = _ensure_backup_file(repo_root, target, relative)
-    if not success:
-        return None, None, None, [], backup_msg
-
-    ok, error_msg, directives = _parse_edit_directives(edits)
-    if not ok:
-        return None, None, None, [], error_msg
-
-    return target, relative, backup_msg, directives, ""
-
-
-def _read_file_lines(target: Path, relative: str) -> Tuple[List[str], bool, str]:
-    try:
-        original_text = target.read_text(encoding="utf-8")
-    except OSError as exc:
-        return [], False, f"Failed to read '{relative}': {exc}"
-
-    lines = original_text.splitlines()
-    had_trailing_newline = original_text.endswith("\n")
-    return lines, had_trailing_newline, ""
-
-
-def _apply_line_directives(
-    lines: List[str], directives: List[Tuple[int, str, str]]
-) -> Tuple[bool, str, int, int]:
-    additions = 0
-    removals = 0
-    directives.sort(key=lambda item: (-item[0], 0 if item[1] == "-" else 1))
-
-    for line_no, op, content in directives:
-        if line_no <= 0:
-            return False, f"Line numbers must be positive. Invalid entry: {line_no}.", 0, 0
-        index = line_no - 1
-        if op == "-":
-            if index >= len(lines):
-                return (
-                    False,
-                    f"Cannot remove line {line_no}: file has only {len(lines)} lines.",
-                    0,
-                    0,
-                )
-            existing = lines[index]
-            if content and existing != content:
-                return (
-                    False,
-                    f"Line {line_no} mismatch for removal.\nExpected: {content}\nFound: {existing}",
-                    0,
-                    0,
-                )
-            del lines[index]
-            removals += 1
-        else:
-            if index > len(lines):
-                return (
-                    False,
-                    f"Cannot insert at line {line_no}: file has only {len(lines)} lines.",
-                    0,
-                    0,
-                )
-            lines.insert(index, content)
-            additions += 1
-
-    return True, "", additions, removals
-
-
-def _write_updated_file(
-    target: Path, relative: str, lines: List[str], had_trailing_newline: bool
-) -> str:
-    new_text = "\n".join(lines)
-    if had_trailing_newline:
-        new_text += "\n"
-
-    try:
-        target.write_text(new_text, encoding="utf-8")
-    except OSError as exc:
-        return f"Failed to write '{relative}': {exc}"
-    return ""
-
-
-def _write_whole_file(
-    project_root: Path,
-    file_path: str,
-    content: str,
-) -> str:
-    """
-    Overwrite a file with the exact content provided. If the file already exists,
-    a backup '<file>.orig' is created first. If the file does not exist, it is
-    created along with any missing parent directories.
-
-    The content is written as-is using UTF-8 encoding.
-    """
-    if not file_path.strip():
-        return "Provide 'file_path' for the file you want to write."
-
-    # Resolve file path within the project root to avoid escaping the repo.
-    try:
-        target, relative = _resolve_repo_file(project_root, file_path)
-    except ValueError as exc:
-        return str(exc)
-
-    # If the file already exists, create a backup alongside it.
-    backup_msg = ""
-    if target.exists():
-        if not target.is_file():
-            return f"Path '{relative}' is not a regular file."
-        success, backup_msg = _ensure_backup_file(project_root, target, relative)
-        if not success:
-            return backup_msg
-
-    # Make sure the directory exists
-    try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        return f"Failed to create parent directory for '{relative}': {exc}"
-
-    # Write new content as-is
-    try:
-        target.write_text(content, encoding="utf-8")
-    except OSError as exc:
-        return f"Failed to write '{relative}': {exc}"
-
-    if backup_msg:
-        return f"{backup_msg}\nWrote {len(content)} byte(s) to '{relative}'."
-    return f"Wrote {len(content)} byte(s) to new file '{relative}'."
-
-
 def build_git_tools(project_root: Path, repo_root: Path, base_branch: str) -> List[ToolSpec]:
+    _ = project_root  # retained for compatibility; editing tools now live elsewhere.
     _ = base_branch  # retained for compatibility; not needed without patch workflow.
     status_tool = ToolSpec(
         name="GitStatus",
@@ -330,48 +119,6 @@ def build_git_tools(project_root: Path, repo_root: Path, base_branch: str) -> Li
             },
         },
         func=_diff_tool,
-    )
-
-    def _write_file_tool(args: Dict[str, Any]) -> str:
-        file_path_value = args.get("file_path") or ""
-        file_path = str(file_path_value)
-
-        content_value = args.get("content")
-        if content_value is None:
-            # Be explicit: content must be provided
-            return "Provide 'content' with the complete new contents of the file."
-
-        content = str(content_value)
-        return _write_whole_file(project_root, file_path, content)
-
-    write_file_tool = ToolSpec(
-        name="GitWriteFile",
-        description=(
-            "Overwrite a file with the exact content you provide.\n\n"
-            "Usage:\n"
-            "1. First, read the whole file (if it exists) to understand its current contents.\n"
-            "2. Prepare the FULL new contents of the file as a single string. Do not use expressions like 'text' + 'more'; they are invalid JSON.\n"
-            "3. Call this tool with 'file_path' and 'content'.\n\n"
-            "If the file already exists, a '<file>.orig' backup is created first. "
-            "If it does not exist, it is created along with any missing parent directories."
-        ),
-        parameters={
-            "type": "object",
-            "properties": {
-                "file_path": {
-                    "type": "string",
-                    "description": "Relative path to the repository file to overwrite or create.",
-                },
-                "content": {
-                    "type": "string",
-                    "description": (
-                        "Complete new contents of the file. This replaces any existing content."
-                    ),
-                },
-            },
-            "required": ["file_path", "content"],
-        },
-        func=_write_file_tool,
     )
 
     def _commit_tool(args: Dict[str, str]) -> str:
@@ -412,6 +159,5 @@ def build_git_tools(project_root: Path, repo_root: Path, base_branch: str) -> Li
     return [
         status_tool,
         diff_tool,
-        write_file_tool,
         commit_tool,
     ]
