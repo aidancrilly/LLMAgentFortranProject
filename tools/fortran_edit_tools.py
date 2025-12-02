@@ -152,6 +152,56 @@ def _create_callable_text(
     return new_text, summary
 
 
+def _edit_callable_text(
+    project_root: Path,
+    file_path: str,
+    callable_type: str,
+    name: str,
+    parent_name: Optional[str],
+    callable_content: str,
+) -> Tuple[Optional[str], str]:
+    file_path_obj, error = _resolve_existing_file(project_root, file_path)
+    if not file_path_obj:
+        return None, error
+
+    try:
+        original_text = file_path_obj.read_text(encoding="utf-8")
+    except OSError as exc:
+        return None, f"Failed to read '{file_path}': {exc}"
+    had_trailing_newline = original_text.endswith("\n")
+    root, lines = parse_fortran_entities(original_text)
+    parent, parent_desc = _locate_parent_entity(root, parent_name)
+    if not parent:
+        return None, parent_desc
+
+    normalized_type = callable_type.lower()
+    if normalized_type not in {"subroutine", "function"}:
+        return None, "callable_type must be 'subroutine' or 'function'."
+    target_callable = _find_child(parent, name, allowed_kinds=[normalized_type])
+    if not target_callable:
+        return None, f"{normalized_type.title()} '{name}' not found in {parent_desc}."
+
+    callable_lines = callable_content.splitlines()
+    if not callable_lines or not callable_content.strip():
+        return None, "callable_content must include the replacement Fortran code."
+
+    start_index = max(target_callable.start_index, 0)
+    end_index = target_callable.end_index
+    if end_index is None:
+        end_index = start_index
+    end_index = min(len(lines) - 1, end_index) if lines else start_index
+
+    del lines[start_index : end_index + 1]
+    _insert_callable_lines(lines, start_index, callable_lines)
+
+    new_text = "\n".join(lines)
+    if had_trailing_newline:
+        new_text += "\n"
+
+    summary = f"Updated {normalized_type} '{name}' in {parent_desc}."
+    return new_text, summary
+
+
 def build_fortran_edit_tools(project_root: Path) -> List[ToolSpec]:
     def _create_callable_tool(args: Dict[str, str]) -> str:
         file_path = str(args.get("file_path") or "").strip()
@@ -177,6 +227,38 @@ def build_fortran_edit_tools(project_root: Path) -> List[ToolSpec]:
             name,
             str(parent_module).strip() if parent_module else None,
             str(append_after).strip() if append_after else None,
+            callable_content,
+        )
+        if new_text is None:
+            return summary
+
+        write_result = write_whole_file(project_root, file_path, new_text)
+        if "Wrote" not in write_result:
+            return write_result
+        return f"{write_result}\n{summary}"
+
+    def _edit_callable_tool(args: Dict[str, str]) -> str:
+        file_path = str(args.get("file_path") or "").strip()
+        callable_type = str(args.get("callable_type") or "").strip().lower()
+        name = str(args.get("name") or "").strip()
+        parent_module = args.get("parent_module")
+        content_value = args.get("callable_content")
+        if not file_path:
+            return "Provide 'file_path' for the Fortran source file."
+        if callable_type not in {"subroutine", "function"}:
+            return "Provide 'callable_type' as 'subroutine' or 'function'."
+        if not name:
+            return "Provide 'name' for the callable to edit."
+        if content_value is None:
+            return "Provide 'callable_content' containing the replacement Fortran code."
+        callable_content = str(content_value)
+
+        new_text, summary = _edit_callable_text(
+            project_root,
+            file_path,
+            callable_type,
+            name,
+            str(parent_module).strip() if parent_module else None,
             callable_content,
         )
         if new_text is None:
@@ -227,4 +309,40 @@ def build_fortran_edit_tools(project_root: Path) -> List[ToolSpec]:
         func=_create_callable_tool,
     )
 
-    return [create_callable_tool]
+    edit_callable_tool = ToolSpec(
+        name="EditFortranCallableInFile",
+        description=(
+            "Replace the implementation of an existing Fortran subroutine or function "
+            "inside a file, optionally scoping the search to a specific module/program."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "Path to the Fortran source file to update.",
+                },
+                "callable_type": {
+                    "type": "string",
+                    "enum": ["subroutine", "function"],
+                    "description": "Type of callable to edit.",
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Name of the existing subroutine or function.",
+                },
+                "parent_module": {
+                    "type": ["string", "null"],
+                    "description": "Module/program expected to contain the callable.",
+                },
+                "callable_content": {
+                    "type": "string",
+                    "description": "Full Fortran source text that should replace the callable.",
+                },
+            },
+            "required": ["file_path", "callable_type", "name", "callable_content"],
+        },
+        func=_edit_callable_tool,
+    )
+
+    return [create_callable_tool, edit_callable_tool]
